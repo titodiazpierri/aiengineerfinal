@@ -1,0 +1,23 @@
+flowchart TD
+    START([Inicio del turno<br/>consulta + historial del checkpointer]) --> SUP
+    SUP{{supervisor<br/>planifica y delega}}
+    SUP -- "tarea de investigación" --> INV[investigador<br/>ReAct + RAG híbrido<br/>buscar_conocimiento · leer_documento]
+    SUP -- "tarea de análisis" --> ANA[analista<br/>ReAct + herramientas Pydantic<br/>series · umbrales · sentimiento]
+    SUP -- "plan completo o límite de pasos" --> SIN[sintetizador<br/>InformeFinal estructurado]
+    INV -- "InformeInvestigacion" --> SUP
+    ANA -- "InformeAnalisis" --> SUP
+    SIN --> REV{{revisor<br/>EvaluacionRubrica + validación de citas}}
+    REV -- "requiere cambios y quedan revisiones" --> SUP
+    REV -- "aprobado / aprobado con advertencias" --> CC{control_criticidad<br/>publicar_para · tokens}
+    CC -- "no crítica" --> CT[cerrar_turno<br/>guarda el Turno en el historial]
+    CC -- "crítica" --> PAUSA[/"interrupt_before<br/>WAITING_APPROVAL"/]
+    PAUSA -- "POST /tasks/{id}/approve aprobado=true" --> AC[accion_critica<br/>publicar_informe]
+    PAUSA -- "aprobado=false: as_node accion_critica" --> CT
+    AC --> CT
+    CT --> FIN([Fin del turno<br/>checkpoint persistido en Redis])
+    classDef agente fill:#e8f0fe,stroke:#3b6fd8,color:#111
+    classDef control fill:#fff4e0,stroke:#d08a00,color:#111
+    classDef humano fill:#fde8e8,stroke:#c43c3c,color:#111
+    class SUP,INV,ANA,SIN,REV agente
+    class CC,CT,AC control
+    class PAUSA humano

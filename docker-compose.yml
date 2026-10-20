@@ -1,0 +1,56 @@
+name: intelligence-system
+
+x-app: &app
+  build: .
+  env_file: .env
+  environment:
+    REDIS_URL: redis://redis:6379/0
+    CHECKPOINTER: redis
+    CHROMA_HOST: chroma
+    CHROMA_PORT: "8000"
+    PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:6006/v1/traces
+  restart: unless-stopped
+  depends_on:
+    redis:
+      condition: service_healthy
+    chroma:
+      condition: service_started
+    phoenix:
+      condition: service_started
+
+services:
+  redis:
+    image: redis:8
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  chroma:
+    image: chromadb/chroma:1.5.9
+    ports: ["8001:8000"]
+    volumes: ["chroma-data:/data"]
+
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+    ports: ["6006:6006", "4317:4317"]
+    volumes: ["phoenix-data:/mnt/data"]
+
+  worker:
+    <<: *app
+    command: ["arq", "app.worker.WorkerSettings"]
+
+  api:
+    <<: *app
+    ports: ["8000:8000"]
+
+volumes:
+  redis-data:
+  chroma-data:
+  phoenix-data:
