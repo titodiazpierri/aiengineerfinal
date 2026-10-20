@@ -1,0 +1,13 @@
+[project]
+name = "intelligence-system"
+version = "1.0.0"
+description = "Sistema de IA de grado producción: RAG híbrido, supervisor multi-agente, API asíncrona, checkpointer persistente y trazas en Arize Phoenix"
+readme = "README.md"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[tool.setuptools.packages.find]
+include = ["app*"]

@@ -1,6 +1,10 @@
 # The Intelligence System
 
-Sistema de IA de grado producción para EcoRuta (operador ficticio de monopatines eléctricos en Buenos Aires). Responde consultas de negocio con un **RAG híbrido**, un **equipo de agentes coordinado por un supervisor**, una **API asíncrona profesional**, **conversaciones persistentes** en un checkpointer de LangGraph, **aprobación humana** para acciones críticas y **trazas completas** en Arize Phoenix.
+Sistema de IA de grado producción para EcoRuta, un operador ficticio de monopatines eléctricos en Buenos Aires, que responde consultas de negocio.
+
+Una consulta entra por una **API FastAPI** que no bloquea: la encola en **Arq** y responde `202` al instante. Un **worker** ejecuta un **grafo de LangGraph** donde un **supervisor** planifica y delega en especialistas. El **investigador** consulta un **RAG híbrido** (ChromaDB + BM25). El **analista** calcula con **herramientas validadas con Pydantic**. El **sintetizador** redacta y el **revisor** audita las citas.
+
+Cada conversación se guarda en un **checkpointer de LangGraph sobre Redis**, así que sobrevive a reinicios y admite preguntas de seguimiento. Las acciones con efectos externos se pausan hasta que un **humano las aprueba**. Cada ejecución deja su árbol de spans, tokens y costo en **Arize Phoenix**.
 
 - Python 3.12+ · FastAPI · LangGraph · Arq · Redis 8 · ChromaDB · Arize Phoenix
 - Todo el flujo es `async`: endpoints, worker, nodos del grafo, herramientas, embeddings, ChromaDB y Redis.
@@ -45,16 +49,33 @@ flowchart LR
     API -->|GET /conversations/id| R
 ```
 
+De dónde sale cada pieza:
+
 | Capa | Archivos | Origen |
 |---|---|---|
-| Cliente LLM unificado (OpenAI / Anthropic por variable de entorno) | `app/llm.py`, `app/settings.py` | Pre-entrega 1 |
-| Salidas estructuradas con Pydantic | `app/agents/contratos.py` | Pre-entrega 2 |
-| Ingesta, fragmentación por tokens e índice en ChromaDB | `app/rag/documentos.py`, `app/rag/ingesta.py` | Pre-entrega 3 |
-| Recuperación híbrida vectorial + BM25 con RRF | `app/rag/recuperador.py`, `app/tools/busqueda.py` | Pre-entrega 4 |
-| Agentes ReAct con herramientas | `app/agents/research_agent.py`, `app/agents/analyst_agent.py`, `app/tools/analisis.py` | Pre-entrega 5 |
-| Supervisor planificador, sintetizador y revisor | `app/agents/supervisor.py`, `app/agents/synthesizer_agent.py`, `app/agents/reviewer_agent.py` | Pre-entrega 6 |
-| API asíncrona, worker Arq, HITL y trazas | `app/main.py`, `app/worker.py`, `app/jobs.py`, `app/hitl.py`, `app/observability.py` | Pre-entrega 7 |
-| Checkpointer persistente y conversaciones multi-turno | `app/graph.py`, `app/agents/state.py` | Entrega final |
+| Cliente LLM asíncrono con timeouts y reintentos (OpenAI / Anthropic por variable de entorno) | `app/llm.py`, `app/settings.py` | Módulo 1 |
+| Cadenas LCEL con contratos Pydantic (`prompt \| llm.with_structured_output(...)`) | `app/agents/contratos.py`, `app/agents/supervisor.py`, `app/agents/synthesizer_agent.py`, `app/agents/reviewer_agent.py` | Módulo 2 |
+| Ingesta con metadatos, fragmentación por tokens e índice en ChromaDB | `app/rag/documentos.py`, `app/rag/ingesta.py` | Módulo 3 |
+| Recuperación híbrida vectorial + BM25 con re-ranking RRF, como herramienta del investigador | `app/rag/recuperador.py`, `app/tools/busqueda.py` | Módulo 4 |
+| Agentes ReAct con herramientas | `app/agents/research_agent.py`, `app/agents/analyst_agent.py`, `app/tools/analisis.py` | Módulo 5 |
+| Supervisor que planifica, delega y corrige con el revisor | `app/agents/supervisor.py`, `app/agents/reviewer_agent.py`, `app/graph.py` | Módulo 6 |
+| API, Redis, worker Arq, HITL y trazas | `app/main.py`, `app/worker.py`, `app/jobs.py`, `app/hitl.py`, `app/observability.py` | Módulo 7 |
+| Checkpointer persistente y conversaciones multi-turno | `app/graph.py`, `app/agents/state.py` | Proyecto final |
+
+## Decisiones de arquitectura
+
+| Decisión | Alternativa descartada | Por qué |
+|---|---|---|
+| La API encola en Arq y un worker separado ejecuta el grafo | Ejecutar el grafo dentro del request de FastAPI | Una ejecución multi-agente tarda decenas de segundos. Encolar mantiene la API en milisegundos, limita la concurrencia con `MAX_JOBS` y permite escalar workers sin tocar la API. |
+| Supervisor planificador con plan explícito (`TareaPlan`) | Supervisor que solo elige el próximo agente | El plan queda en el estado y en las trazas. El supervisor reintenta una tarea fallida hasta `MAX_INTENTOS_POR_TAREA` y corta en `MAX_PASOS_SUPERVISOR`, así que no hay bucles infinitos. |
+| Revisor con rúbrica y validación determinística de citas | Confiar en la respuesta del sintetizador | Un LLM puede citar documentos que no existen o inventar cifras. Antes de la rúbrica, controles determinísticos verifican que cada `doc_id` exista y que cada cifra del informe esté respaldada por los aportes de los especialistas. Si no alcanza `PUNTAJE_MINIMO_RUBRICA`, el informe vuelve al supervisor. |
+| RAG híbrido vectorial + BM25 fusionados con RRF | Solo búsqueda vectorial | Las consultas de negocio tienen cifras, siglas y nombres propios (NPS, VoltSur, Q3) que BM25 encuentra mejor que los embeddings. RRF combina los rankings sin calibrar puntajes de escalas distintas. |
+| Ingesta idempotente por huella del corpus | Reindexar en cada arranque | El worker arranca rápido y no paga embeddings de más. Solo reindexa si cambian los documentos. |
+| `thread_id` = `conversacion_id` y canales de trabajo reiniciados con `Overwrite` | Un hilo nuevo por job | La conversación conserva su historial (`turnos`, con reducer acumulativo) y cada turno arranca con un plan limpio sin arrastrar aportes viejos. |
+| Bloqueo por conversación (`SET NX`) | Permitir turnos simultáneos en el mismo hilo | Dos turnos concurrentes sobre el mismo checkpoint producirían un historial inconsistente. La API responde `409`. |
+| HITL con `interrupt_before` en un nodo dedicado | Pedir confirmación dentro de la herramienta | La pausa queda en el checkpoint, así que la aprobación puede llegar horas después o a otro worker. Rechazar usa `as_node`, sin ejecutar el efecto secundario. |
+| Estado del job en Redis con transiciones `WATCH`/`MULTI` | Leer el estado desde el checkpoint | El job (`PENDING` → `RUNNING` → `WAITING_APPROVAL` → `DONE`) es el contrato con el cliente HTTP y se actualiza atómicamente aunque haya varios workers. |
+| Tracer provider de Phoenix no global y span raíz por ejecución con `session.id` | Instrumentación global | Se exportan solo las trazas del sistema de agentes, y cada conversación aparece agrupada como sesión en Phoenix. |
 
 ## Grafo de agentes
 
@@ -181,6 +202,18 @@ El script guarda el detalle en `resultados/` y reescribe esta tabla:
 Se completa al ejecutar `python scripts/pruebas_sistema.py`.
 <!-- /PRUEBAS -->
 
+## Concurrencia
+
+```bash
+python scripts/prueba_carga.py -n 5
+```
+
+Lanza 5 consultas en paralelo y mide el encolado de `POST /tasks`, la ejecución en el worker (p50 y p95) y los tokens por nodo:
+
+<!-- RESULTADOS_CARGA -->
+Se completa al ejecutar `python scripts/prueba_carga.py`.
+<!-- /RESULTADOS_CARGA -->
+
 ## Variables de entorno
 
 Todas están en `.env.example`. Docker Compose sobrescribe las direcciones internas (`REDIS_URL`, `CHROMA_HOST`, `CHROMA_PORT`, `PHOENIX_COLLECTOR_ENDPOINT`).
@@ -195,6 +228,8 @@ Todas están en `.env.example`. Docker Compose sobrescribe las direcciones inter
 | Agentes | `MAX_PASOS_SUPERVISOR`, `MAX_INTENTOS_POR_TAREA`, `MAX_REVISIONES`, `PUNTAJE_MINIMO_RUBRICA`, `RECURSION_LIMIT_GRAFO`, `RECURSION_LIMIT_ESPECIALISTA`, `TURNOS_DE_CONTEXTO`, `UMBRAL_TOKENS_APROBACION` |
 
 ## Ejecución sin Docker
+
+Requiere Python 3.12 o superior (`requires-python` en `pyproject.toml`).
 
 ```bash
 python -m venv .venv
@@ -225,7 +260,7 @@ app/
   rag/               Documentos, ingesta y recuperador híbrido
   tools/             Herramientas de búsqueda y análisis
 data/conocimiento/   Base de conocimiento
-scripts/             Pruebas del sistema
+scripts/             Pruebas de punta a punta y prueba de concurrencia
 docs/                Diagrama del grafo
 screenshots/         Evidencia de Phoenix
 ```
